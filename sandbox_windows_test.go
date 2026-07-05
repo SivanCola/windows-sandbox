@@ -3,6 +3,7 @@
 package winsandbox
 
 import (
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -212,6 +213,37 @@ func TestWindowsSandboxAllowsWorkspaceWriteAndDeniesOutside(t *testing.T) {
 	}
 }
 
+func TestWindowsSandboxReadOnlyAllowsReadsAndDeniesWrites(t *testing.T) {
+	if !Available() {
+		t.Skip("windows sandbox APIs unavailable")
+	}
+	sh := powershellArgvForTest(t, "")
+	if sh == nil {
+		t.Skip("PowerShell unavailable")
+	}
+	workspace := t.TempDir()
+	readableFile := filepath.Join(workspace, "readable.txt")
+	if err := os.WriteFile(readableFile, []byte("visible"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writtenFile := filepath.Join(workspace, "written.txt")
+
+	script := "$ErrorActionPreference='Stop'; " +
+		"$value = Get-Content -Raw -LiteralPath " + psQuote(readableFile) + "; " +
+		"if ($value.Trim() -ne 'visible') { exit 8 }; " +
+		"try { Set-Content -LiteralPath " + psQuote(writtenFile) + " -Value nope; exit 9 } catch { exit 0 }"
+	result, err := Run(Spec{WritableRoots: []string{workspace}, Network: true, Writable: false, TempPrefix: "windows-sandbox-test-"}, append(sh, script), RunOptions{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatalf("sandbox run failed: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("read-only sandbox exit code = %d, want 0", result.ExitCode)
+	}
+	if _, err := os.Stat(writtenFile); err == nil {
+		t.Fatalf("read-only sandbox unexpectedly wrote %s", writtenFile)
+	}
+}
+
 func TestWindowsSandboxDeniesForbidRead(t *testing.T) {
 	if !Available() {
 		t.Skip("windows sandbox APIs unavailable")
@@ -239,6 +271,185 @@ func TestWindowsSandboxDeniesForbidRead(t *testing.T) {
 	}
 	if result.ExitCode != 0 {
 		t.Fatalf("forbid_read was not enforced, exit code = %d", result.ExitCode)
+	}
+}
+
+func TestWindowsSandboxDeniesForbidReadInReadOnlyAppContainer(t *testing.T) {
+	if !Available() {
+		t.Skip("windows sandbox APIs unavailable")
+	}
+	sh := powershellArgvForTest(t, "")
+	if sh == nil {
+		t.Skip("PowerShell unavailable")
+	}
+	workspace := t.TempDir()
+	secretDir := filepath.Join(workspace, "secret")
+	if err := os.Mkdir(secretDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secretFile := filepath.Join(secretDir, "token.txt")
+	if err := os.WriteFile(secretFile, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	script := "$ErrorActionPreference='Stop'; " +
+		"try { Get-Content -LiteralPath " + psQuote(secretFile) + "; exit 9 } catch { exit 0 }"
+	result, err := Run(Spec{WritableRoots: []string{workspace}, ForbidReadRoots: []string{secretDir}, Network: true, Writable: false, TempPrefix: "windows-sandbox-test-"}, append(sh, script), RunOptions{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatalf("sandbox run failed: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("forbid_read was not enforced in read-only AppContainer, exit code = %d", result.ExitCode)
+	}
+}
+
+func TestWindowsSandboxStdioEnvDirAndExitCode(t *testing.T) {
+	if !Available() {
+		t.Skip("windows sandbox APIs unavailable")
+	}
+	sh := powershellArgvForTest(t, "")
+	if sh == nil {
+		t.Skip("PowerShell unavailable")
+	}
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace with spaces")
+	if err := os.Mkdir(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stdin := tempFileWithContent(t, "stdin.txt", "hello from stdin\n")
+	stdout := tempFileWithContent(t, "stdout.txt", "")
+	stderr := tempFileWithContent(t, "stderr.txt", "")
+	defer stdin.Close()
+	defer stdout.Close()
+	defer stderr.Close()
+	if _, err := stdin.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	script := "$inputText = [Console]::In.ReadToEnd(); " +
+		"Write-Output ('OUT:' + $inputText.Trim()); " +
+		"[Console]::Error.WriteLine('ERR:' + $env:WINDOWS_SANDBOX_TEST_FLAG); " +
+		"if ((Get-Location).Path -ne " + psQuote(workspace) + ") { exit 7 }; " +
+		"if ((Split-Path -Leaf $env:TEMP) -notlike 'windows-sandbox-test-*') { exit 8 }; " +
+		"exit 23"
+	result, err := Run(
+		Spec{WritableRoots: []string{workspace}, Network: true, Writable: true, TempPrefix: "windows-sandbox-test-"},
+		append(sh, script),
+		RunOptions{
+			Stdin:  stdin,
+			Stdout: stdout,
+			Stderr: stderr,
+			Env:    append(os.Environ(), "WINDOWS_SANDBOX_TEST_FLAG=flag-from-env"),
+			Dir:    workspace,
+		},
+	)
+	if err != nil {
+		t.Fatalf("sandbox run failed: %v", err)
+	}
+	if result.ExitCode != 23 {
+		t.Fatalf("exit code = %d, want 23", result.ExitCode)
+	}
+	if got := readWholeFile(t, stdout.Name()); !strings.Contains(got, "OUT:hello from stdin") {
+		t.Fatalf("stdout = %q, want stdin echo", got)
+	}
+	if got := readWholeFile(t, stderr.Name()); !strings.Contains(got, "ERR:flag-from-env") {
+		t.Fatalf("stderr = %q, want env echo", got)
+	}
+}
+
+func TestWindowsSandboxNetworkDisabledBlocksLoopbackConnect(t *testing.T) {
+	if !Available() {
+		t.Skip("windows sandbox APIs unavailable")
+	}
+	sh := powershellArgvForTest(t, "")
+	if sh == nil {
+		t.Skip("PowerShell unavailable")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback listener unavailable: %v", err)
+	}
+	defer listener.Close()
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			_ = conn.Close()
+			accepted <- struct{}{}
+		}
+	}()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	script := "$client = [Net.Sockets.TcpClient]::new(); " +
+		"$async = $client.BeginConnect('127.0.0.1', " + port + ", $null, $null); " +
+		"if ($async.AsyncWaitHandle.WaitOne(1500)) { " +
+		"  try { $client.EndConnect($async); $client.Close(); exit 9 } catch { exit 0 } " +
+		"} else { $client.Close(); exit 0 }"
+	result, err := Run(Spec{WritableRoots: []string{workspace}, Network: false, Writable: false, TempPrefix: "windows-sandbox-test-"}, append(sh, script), RunOptions{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatalf("sandbox run failed: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("network-disabled sandbox connected to loopback, exit code = %d", result.ExitCode)
+	}
+	select {
+	case <-accepted:
+		t.Fatal("network-disabled sandbox reached the loopback listener")
+	default:
+	}
+}
+
+func TestWindowsSandboxKillsChildProcessTreeOnReturn(t *testing.T) {
+	if !Available() {
+		t.Skip("windows sandbox APIs unavailable")
+	}
+	sh := powershellArgvForTest(t, "")
+	if sh == nil {
+		t.Skip("PowerShell unavailable")
+	}
+	workspace := t.TempDir()
+	marker := filepath.Join(workspace, "child-marker.txt")
+	childCommand := "Start-Sleep -Seconds 5; Set-Content -LiteralPath " + psQuote(marker) + " -Value alive"
+	script := "$exe = (Get-Process -Id $PID).Path; " +
+		"$child = Start-Process -FilePath $exe -ArgumentList @('-NoProfile','-NonInteractive','-Command'," + psQuote(childCommand) + ") -PassThru; " +
+		"if (-not $child.Id) { exit 8 }; " +
+		"exit 0"
+	result, err := Run(Spec{WritableRoots: []string{workspace}, Network: true, Writable: true, TempPrefix: "windows-sandbox-test-"}, append(sh, script), RunOptions{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatalf("sandbox run failed: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("sandbox exit code = %d, want 0", result.ExitCode)
+	}
+	time.Sleep(7 * time.Second)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatalf("sandbox job object did not kill child process; marker exists: %s", marker)
+	}
+}
+
+func TestWindowsSandboxTimeoutTerminatesCommand(t *testing.T) {
+	if !Available() {
+		t.Skip("windows sandbox APIs unavailable")
+	}
+	sh := powershellArgvForTest(t, "")
+	if sh == nil {
+		t.Skip("PowerShell unavailable")
+	}
+	t.Setenv("WINDOWS_SANDBOX_WAIT_MS", "1000")
+	workspace := t.TempDir()
+	start := time.Now()
+	result, err := Run(Spec{WritableRoots: []string{workspace}, Network: true, Writable: true, TempPrefix: "windows-sandbox-test-"}, append(sh, "Start-Sleep -Seconds 5; exit 9"), RunOptions{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
+	if err == nil {
+		t.Fatalf("timed-out sandbox should fail, code=%d", result.ExitCode)
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("timeout error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("timeout took too long: %s", elapsed)
 	}
 }
 
@@ -314,6 +525,28 @@ func powershellArgvForTest(t *testing.T, command string) []string {
 		return args
 	}
 	return nil
+}
+
+func tempFileWithContent(t *testing.T, pattern string, content string) *os.File {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	return f
+}
+
+func readWholeFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 func psTrySetContent(path, value string) string {

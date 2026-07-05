@@ -47,3 +47,17 @@ setup, so writable launches with `Network: false` fail closed.
 
 `Available` and `Run` return unavailable on non-Windows hosts. The module still
 builds on non-Windows platforms so callers can depend on it unconditionally.
+
+## Verification Matrix
+
+The Windows CI tests exercise both sandbox launch modes:
+
+- writable low-integrity commands can write inside configured roots and command
+  temp, but not outside configured roots;
+- read-only AppContainer commands can read allowed roots but cannot write them;
+- `ForbidReadRoots` are denied in both writable and read-only launches;
+- `Network: false` AppContainer launches cannot connect to a loopback listener;
+- stdin, stdout, stderr, environment overrides, working directory, paths with
+  spaces, and child exit codes are preserved;
+- kill-on-close Job Objects clean up child process trees;
+- temporary ACL grants/denies are removed after the command exits.
