@@ -225,13 +225,14 @@ func TestWindowsResidueMarkerWriteFailurePropagates(t *testing.T) {
 	}
 }
 
-func TestWindowsMutatedRootsForRunLocksWritableExeDirOnly(t *testing.T) {
+func TestWindowsMutatedRootsForRunLocksNonSystemExeDirOnly(t *testing.T) {
 	workspace := t.TempDir()
-	// A user-writable tool directory must join the lock set; a Windows system
-	// directory (not user-writable) must not, or commands sharing the system
-	// shell would needlessly serialize.
-	writableToolDir := t.TempDir()
-	toolExe := filepath.Join(writableToolDir, "mytool.exe")
+	// A non-system tool directory must join the lock set; a Windows system
+	// directory must not, or commands sharing the system shell would needlessly
+	// serialize. Membership is by path, not by a write probe, so this holds even
+	// when the test process is elevated (as CI's runner is).
+	toolDir := t.TempDir()
+	toolExe := filepath.Join(toolDir, "mytool.exe")
 	if err := os.WriteFile(toolExe, []byte("not really an exe"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -240,15 +241,16 @@ func TestWindowsMutatedRootsForRunLocksWritableExeDirOnly(t *testing.T) {
 	if !containsWindowsPath(got, workspace) {
 		t.Fatalf("mutated roots = %v, want workspace", got)
 	}
-	if !containsWindowsPath(got, writableToolDir) {
-		t.Fatalf("mutated roots = %v, want writable tool dir %s", got, writableToolDir)
+	if !containsWindowsPath(got, toolDir) {
+		t.Fatalf("mutated roots = %v, want tool dir %s", got, toolDir)
 	}
 
-	// A system executable's directory (System32) is not user-writable and must be
-	// excluded. Resolve a real system tool to avoid depending on PATH layout.
+	// A system executable's directory (System32) must be excluded regardless of
+	// the process's integrity level. Resolve a real system tool to avoid
+	// depending on PATH layout.
 	sysExe := systemRootTool("icacls.exe")
 	if !filepath.IsAbs(sysExe) {
-		t.Skip("no absolute system tool to test the non-writable exclusion")
+		t.Skip("no absolute system tool to test the system-root exclusion")
 	}
 	sysRoots := windowsMutatedRootsForRun(Spec{WritableRoots: []string{workspace}, Writable: true}, sysExe)
 	if containsWindowsPath(sysRoots, filepath.Dir(sysExe)) {
@@ -256,13 +258,20 @@ func TestWindowsMutatedRootsForRunLocksWritableExeDirOnly(t *testing.T) {
 	}
 }
 
-func TestWindowsPathUserWritable(t *testing.T) {
-	writable := t.TempDir()
-	if !windowsPathUserWritable(writable) {
-		t.Fatalf("temp dir %s should be user-writable", writable)
+func TestIsWindowsSystemRoot(t *testing.T) {
+	// System locations are excluded by path, independent of writability.
+	sysExe := systemRootTool("icacls.exe")
+	if filepath.IsAbs(sysExe) && !isWindowsSystemRoot(filepath.Dir(sysExe)) {
+		t.Fatalf("%s should be classified as a system root", filepath.Dir(sysExe))
 	}
-	if windowsPathUserWritable(filepath.Join(writable, "does-not-exist")) {
-		t.Fatal("a missing directory must not be reported writable")
+	if root := os.Getenv("ProgramFiles"); root != "" {
+		if !isWindowsSystemRoot(filepath.Join(root, "SomeApp")) {
+			t.Fatalf("a path under %s should be a system root", root)
+		}
+	}
+	// A user temp directory is never a system root.
+	if isWindowsSystemRoot(t.TempDir()) {
+		t.Fatal("a user temp dir must not be classified as a system root")
 	}
 }
 
@@ -406,19 +415,20 @@ func TestWindowsSandboxConcurrentDistinctWorkspacesSharedToolDir(t *testing.T) {
 	if !Available() {
 		t.Skip("windows sandbox APIs unavailable")
 	}
-	sh := powershellArgvForTest(t, "")
-	if sh == nil {
-		t.Skip("PowerShell unavailable")
+	// Stage a copy of cmd.exe in a shared user directory as the tool. cmd.exe is a
+	// single self-contained binary with no side-by-side runtime dependencies, so a
+	// copy runs standalone — unlike pwsh.exe, which needs its hostfxr/DLLs next to
+	// it. Each concurrent run resolves argv[0] into this shared directory, so the
+	// runs contend on it even though their workspaces differ.
+	cmdExe := systemRootTool("cmd.exe")
+	if !filepath.IsAbs(cmdExe) {
+		t.Skip("cmd.exe not found under System32")
 	}
-	// A shared, user-writable tool directory holding a copy of the shell. Each
-	// concurrent run resolves argv[0] into this directory, so the runs contend on
-	// it even though their workspaces differ.
 	toolDir := t.TempDir()
 	sharedTool := filepath.Join(toolDir, "sandbox-shared-tool.exe")
-	if err := copyFileForTest(t, sh[0], sharedTool); err != nil {
+	if err := copyFileForTest(t, cmdExe, sharedTool); err != nil {
 		t.Skipf("cannot stage shared tool: %v", err)
 	}
-	toolArgv := append([]string{sharedTool}, sh[1:]...)
 
 	const n = 4
 	var wg sync.WaitGroup
@@ -429,10 +439,12 @@ func TestWindowsSandboxConcurrentDistinctWorkspacesSharedToolDir(t *testing.T) {
 			defer wg.Done()
 			workspace := t.TempDir() // distinct per run: workspace locks do not collide
 			target := filepath.Join(workspace, "out.txt")
-			script := "$ErrorActionPreference='Stop'; Set-Content -LiteralPath " + psQuote(target) + " -Value ok"
+			// cmd.exe /c echo ok> "<target>". No spaces before '>' so the redirect
+			// target is exactly the path.
+			toolArgv := []string{sharedTool, "/c", "echo ok> " + target}
 			result, err := Run(
 				Spec{WritableRoots: []string{workspace}, Network: true, Writable: true, TempPrefix: "windows-sandbox-test-"},
-				append(toolArgv, script),
+				toolArgv,
 				RunOptions{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr},
 			)
 			if err != nil {

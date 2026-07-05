@@ -184,23 +184,43 @@ func windowsMutatedRoots(spec Spec) []string {
 }
 
 // windowsMutatedRootsForRun extends windowsMutatedRoots with the executable
-// directories the run will grant on, but only the *user-writable* ones. A run
+// directories the run will grant on, but only the non-system ones. A run
 // snapshots/grants/restores argv[0]'s directory (and a Git install root), so two
-// runs in different workspaces that share one user-writable tool directory would
-// otherwise interleave their ACL snapshots and corrupt each other. System tool
-// directories (System32, Program Files) are not user-writable — the grant there
-// no-ops and is skipped — and must be left out of the lock, or every command
-// sharing the system shell would needlessly serialize. Only writable exe dirs
-// are both actually mutated and a real contention point, so only those join the
-// lock.
+// runs in different workspaces that share one tool directory would otherwise
+// interleave their ACL snapshots and corrupt each other. System tool directories
+// (System32, Program Files) must be left out of the lock, or every command
+// sharing the system shell would needlessly serialize; they are identified by
+// path membership rather than a write probe, because a write probe misclassifies
+// them whenever the process is elevated (an admin can create a file under
+// System32, which would wrongly pull it into the lock set).
 func windowsMutatedRootsForRun(spec Spec, exe string) []string {
 	roots := windowsMutatedRoots(spec)
 	for _, dir := range windowsExecutableGrantRoots(exe) {
-		if windowsPathUserWritable(dir) {
+		if !isWindowsSystemRoot(dir) {
 			roots = append(roots, dir)
 		}
 	}
 	return roots
+}
+
+// isWindowsSystemRoot reports whether path is inside a Windows system location
+// (%SystemRoot%, the Program Files variants). Determined by path membership, not
+// by attempting a write, so the result is stable regardless of the process's
+// integrity level or admin rights. Used to keep shared system directories out of
+// the per-root lock set.
+func isWindowsSystemRoot(path string) bool {
+	clean := strings.ToLower(filepath.Clean(path))
+	for _, envVar := range []string{"SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"} {
+		root := os.Getenv(envVar)
+		if root == "" {
+			continue
+		}
+		root = strings.ToLower(filepath.Clean(root))
+		if clean == root || strings.HasPrefix(clean, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // forbid_read applies a deny ACE for the current user SID so a same-user
@@ -363,24 +383,4 @@ func windowsProcessAlive(pidStr string) bool {
 		return false
 	}
 	return code == stillActiveExitCode
-}
-
-// windowsPathUserWritable reports whether dir is writable by the current user,
-// tested by actually creating and removing a probe file. This is more reliable
-// than parsing the DACL (effective access depends on group membership,
-// inherited ACEs, and integrity level) and mirrors what the grant path itself
-// will do. A non-existent or non-writable directory returns false, so it is left
-// out of the lock and the grant simply no-ops there.
-func windowsPathUserWritable(dir string) bool {
-	if !dirExists(dir) {
-		return false
-	}
-	f, err := os.CreateTemp(dir, ".windows-sandbox-writable-*")
-	if err != nil {
-		return false
-	}
-	name := f.Name()
-	_ = f.Close()
-	_ = os.Remove(name)
-	return true
 }
