@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -256,6 +257,16 @@ func windowsDenyMarkerPath() string {
 	return filepath.Join(windowsDenyMarkerDir(), strconv.Itoa(os.Getpid())+".txt")
 }
 
+// residueMarkerOwned reports whether this process has written its own residue
+// marker. The marker path is keyed by PID alone, and Windows reuses PIDs, so a
+// file at our path is not necessarily ours: a crashed predecessor that held
+// this PID may have left it behind. Ownership is what separates "our live
+// marker" from "a dead run's residue record that happens to share our PID" —
+// without it, cleanup would delete the predecessor's record while its ACEs are
+// still on disk, orphaning them beyond any future sweep's reach. One sandboxed
+// command runs per helper process, so a process-wide flag is sufficient.
+var residueMarkerOwned atomic.Bool
+
 // recordResidueBeforeApply appends one "<kind>\t<path>" line to this process's
 // marker and flushes it to disk. It is called immediately before the matching
 // ACE is applied; a failure here must abort the run before the ACE is applied so
@@ -267,7 +278,23 @@ func recordResidueBeforeApply(kind residueKind, path string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create residue marker dir: %w", err)
 	}
-	f, err := os.OpenFile(windowsDenyMarkerPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	marker := windowsDenyMarkerPath()
+	if !residueMarkerOwned.Load() && pathExists(marker) {
+		// A marker at our path that we did not write belongs to a dead
+		// predecessor that used this PID before us (PIDs are unique among live
+		// processes). Consume its residue now, before our first line lands in
+		// the same file — appending to it would mix the two runs' records, and
+		// our cleanup would then delete both while only our own ACEs had been
+		// removed. The run-start sweep normally consumes it first; this covers
+		// callers that record without sweeping.
+		sweepResidueMarkerFile(marker, sandboxResidueSIDs())
+	}
+	// Claim ownership before creating the file, not after: once the file can
+	// exist at our path, nothing may mistake it for a dead predecessor's. A
+	// failed open leaves the flag set with no file, which is harmless — clear
+	// becomes a no-op remove.
+	residueMarkerOwned.Store(true)
+	f, err := os.OpenFile(marker, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("open residue marker: %w", err)
 	}
@@ -282,52 +309,81 @@ func recordResidueBeforeApply(kind residueKind, path string) error {
 }
 
 // clearWindowsDenyResidueMarker drops this process's marker after its own
-// cleanup has removed every recorded ACE.
+// cleanup has removed every recorded ACE. It only removes a marker this
+// process actually wrote: a file at our path that we never touched records a
+// dead PID-reuse predecessor's residue, and deleting it would orphan that
+// residue — the ACEs would stay on disk with nothing left for a sweep to find.
 func clearWindowsDenyResidueMarker() {
+	if !residueMarkerOwned.Load() {
+		return
+	}
 	_ = os.Remove(windowsDenyMarkerPath())
+	residueMarkerOwned.Store(false)
 }
 
 // sweepWindowsDenyResidue removes ACEs left by crashed runs. It only acts on
-// markers whose owning PID is no longer alive, and only removes the stable
-// sandbox-applied trustees, so it never disturbs a live run or a legitimate ACL.
-// Best-effort: any error is ignored so it can never block a run.
+// markers whose owning process is provably gone: a PID that is no longer
+// alive, or a file at this process's own path that this process never wrote —
+// Windows reuses PIDs, so such a file records a dead predecessor's residue,
+// and skipping it here (while cleanup deleted it blindly) is how that residue
+// used to leak forever. Only the stable sandbox-applied trustees are removed,
+// so it never disturbs a live run or a legitimate ACL. Best-effort: any error
+// is ignored so it can never block a run.
 func sweepWindowsDenyResidue() {
 	dir := windowsDenyMarkerDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	userSID, _ := currentProcessUserSIDString()
-	// The sandbox only ever applies these trustees, for both grants and denies,
-	// so removing exactly them cannot disturb a legitimate ACL.
-	sandboxSIDs := dedupeSIDStrings([]string{
-		allApplicationPackagesSID,
-		allRestrictedApplicationPackagesSID,
-		userSID,
-	})
+	sandboxSIDs := sandboxResidueSIDs()
 	self := strconv.Itoa(os.Getpid())
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".txt") {
 			continue
 		}
 		pid := strings.TrimSuffix(entry.Name(), ".txt")
-		if pid == self || windowsProcessAlive(pid) {
-			continue
-		}
-		markerPath := filepath.Join(dir, entry.Name())
-		for _, e := range readResidueMarker(markerPath) {
-			if !pathExists(e.path) || !sweepableResidue(e) {
+		if pid == self {
+			// Our own path is live only if this process wrote it; otherwise it
+			// was left by a dead predecessor that held this PID before us
+			// (PIDs are unique among live processes), so fall through and
+			// consume it like any other crash residue.
+			if residueMarkerOwned.Load() {
 				continue
 			}
-			switch e.kind {
-			case residueDeny:
-				removeDeniedAppContainerSIDs(e.path, sandboxSIDs)
-			case residueGrant:
-				removeGrantedAppContainerSIDs(e.path, sandboxSIDs)
-			}
+		} else if windowsProcessAlive(pid) {
+			continue
 		}
-		_ = os.Remove(markerPath)
+		sweepResidueMarkerFile(filepath.Join(dir, entry.Name()), sandboxSIDs)
 	}
+}
+
+// sandboxResidueSIDs is the trustee set the sweep removes. The sandbox only
+// ever applies these trustees, for both grants and denies, so removing exactly
+// them cannot disturb a legitimate ACL.
+func sandboxResidueSIDs() []string {
+	userSID, _ := currentProcessUserSIDString()
+	return dedupeSIDStrings([]string{
+		allApplicationPackagesSID,
+		allRestrictedApplicationPackagesSID,
+		userSID,
+	})
+}
+
+// sweepResidueMarkerFile removes the ACEs recorded in one dead run's marker,
+// then the marker itself.
+func sweepResidueMarkerFile(markerPath string, sandboxSIDs []string) {
+	for _, e := range readResidueMarker(markerPath) {
+		if !pathExists(e.path) || !sweepableResidue(e) {
+			continue
+		}
+		switch e.kind {
+		case residueDeny:
+			removeDeniedAppContainerSIDs(e.path, sandboxSIDs)
+		case residueGrant:
+			removeGrantedAppContainerSIDs(e.path, sandboxSIDs)
+		}
+	}
+	_ = os.Remove(markerPath)
 }
 
 // sweepableResidue reports whether a marker entry names a path the sandbox
@@ -377,7 +433,10 @@ func readResidueMarker(path string) []residueEntry {
 // windowsProcessAlive reports whether the given PID is still running. A parse
 // failure or a process that cannot be opened is treated as not-alive so stale
 // markers get cleaned; PID reuse can only delay cleanup, never corrupt a live
-// run (a live run holds the root lock and re-records its own marker).
+// run or lose residue: a live run's own marker is protected by ownership
+// (residueMarkerOwned), and a stale marker whose PID is reused by an unrelated
+// process merely waits until that process exits — unless the reuser is a
+// sandbox helper itself, which consumes the stale file at run start.
 func windowsProcessAlive(pidStr string) bool {
 	pid, err := strconv.ParseUint(pidStr, 10, 32)
 	if err != nil || pid == 0 {

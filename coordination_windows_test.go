@@ -225,6 +225,89 @@ func TestWindowsResidueMarkerWriteFailurePropagates(t *testing.T) {
 	}
 }
 
+func TestWindowsResidueMarkerPIDReuseLifecycle(t *testing.T) {
+	// The marker path is keyed by PID alone and Windows reuses PIDs, so a file
+	// at our own path is not necessarily ours. A run must not delete a
+	// predecessor's marker as if it were its own (that orphans the recorded
+	// residue forever), and the run-start sweep must consume it rather than
+	// skip it as "self".
+	tmp := t.TempDir()
+	t.Setenv("TMP", tmp)
+	t.Setenv("TEMP", tmp)
+	if err := os.MkdirAll(windowsDenyMarkerDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	residueMarkerOwned.Store(false)
+	defer residueMarkerOwned.Store(false)
+
+	// A marker at our PID's path that this process never wrote models the dead
+	// predecessor. The recorded path deliberately does not exist so consuming
+	// it exercises only the marker lifecycle, not icacls.
+	stale := windowsDenyMarkerPath()
+	if err := os.WriteFile(stale, []byte("grant\t"+filepath.Join(tmp, "gone-tool-dir")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cleanup must leave a marker this process did not write.
+	clearWindowsDenyResidueMarker()
+	if !pathExists(stale) {
+		t.Fatal("clear removed a marker this process never wrote, orphaning the predecessor's residue")
+	}
+
+	// The sweep must consume it instead of skipping pid == self.
+	sweepWindowsDenyResidue()
+	if pathExists(stale) {
+		t.Fatal("sweep skipped a dead predecessor's marker at our own PID path")
+	}
+
+	// Once this process records, the marker is owned: the sweep must leave it
+	// alone and cleanup must remove it.
+	if err := recordResidueBeforeApply(residueDeny, filepath.Join(tmp, "own-root")); err != nil {
+		t.Fatalf("record own entry: %v", err)
+	}
+	sweepWindowsDenyResidue()
+	if !pathExists(windowsDenyMarkerPath()) {
+		t.Fatal("sweep removed this process's live marker")
+	}
+	clearWindowsDenyResidueMarker()
+	if pathExists(windowsDenyMarkerPath()) {
+		t.Fatal("clear did not remove this process's own marker")
+	}
+}
+
+func TestWindowsResidueRecordConsumesStalePredecessorMarker(t *testing.T) {
+	// If recording starts while a dead predecessor's same-PID marker is still
+	// present (a caller that records without sweeping first), the first record
+	// must consume it rather than append to it: mixing the two runs' lines
+	// would let this run's cleanup delete the predecessor's record while only
+	// this run's ACEs had been removed.
+	tmp := t.TempDir()
+	t.Setenv("TMP", tmp)
+	t.Setenv("TEMP", tmp)
+	if err := os.MkdirAll(windowsDenyMarkerDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	residueMarkerOwned.Store(false)
+	defer residueMarkerOwned.Store(false)
+
+	if err := os.WriteFile(windowsDenyMarkerPath(), []byte("grant\t"+filepath.Join(tmp, "predecessor-tool-dir")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ownRoot := filepath.Join(tmp, "own-root")
+	if err := recordResidueBeforeApply(residueDeny, ownRoot); err != nil {
+		t.Fatalf("record own entry: %v", err)
+	}
+	got := readResidueMarker(windowsDenyMarkerPath())
+	want := []residueEntry{{kind: residueDeny, path: ownRoot}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("marker after first record = %v, want only this run's entry %v", got, want)
+	}
+	clearWindowsDenyResidueMarker()
+	if pathExists(windowsDenyMarkerPath()) {
+		t.Fatal("clear did not remove this process's own marker")
+	}
+}
+
 func TestSweepableResidueRefusesSystemPaths(t *testing.T) {
 	// The sweep must never act on a marker entry that names a system directory,
 	// even though the current recorder can no longer write one: a marker left by
