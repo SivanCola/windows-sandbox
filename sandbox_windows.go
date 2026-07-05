@@ -608,14 +608,23 @@ func grantAppContainerFilesystem(sid *windows.SID, spec Spec, extraWritableRoots
 		}
 		cleanup = append(cleanup, restore)
 		restoreIndex := len(cleanup) - 1
-		if err := denyAppContainerSIDs(root, objectSIDStrs, "RX"); err != nil {
+		denySIDStrs := forbidReadDenySIDStrings(objectSIDStrs)
+		if err := denyAppContainerSIDs(root, denySIDStrs, "RX"); err != nil {
 			runCleanup(cleanup)()
 			return func() {}, err
 		}
-		removeAdded := func() { removeDeniedAppContainerSIDs(root, objectSIDStrs) }
+		removeAdded := func() { removeDeniedAppContainerSIDs(root, denySIDStrs) }
 		cleanup[restoreIndex] = cleanupPathSecurity(restore, removeAdded, nil)
 	}
 	return runCleanup(cleanup), nil
+}
+
+func forbidReadDenySIDStrings(base []string) []string {
+	out := append([]string(nil), base...)
+	if userSID, err := currentProcessUserSIDString(); err == nil && userSID != "" {
+		out = append(out, userSID)
+	}
+	return dedupeSIDStrings(out)
 }
 
 func grantAppContainerExecutable(sid *windows.SID, exe string) (func(), error) {

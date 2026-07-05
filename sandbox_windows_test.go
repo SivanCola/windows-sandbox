@@ -325,11 +325,12 @@ func TestWindowsSandboxStdioEnvDirAndExitCode(t *testing.T) {
 	if _, err := stdin.Seek(0, 0); err != nil {
 		t.Fatal(err)
 	}
+	cwdMarker := filepath.Join(workspace, "cwd-marker.txt")
 
 	script := "$inputText = [Console]::In.ReadToEnd(); " +
 		"Write-Output ('OUT:' + $inputText.Trim()); " +
 		"[Console]::Error.WriteLine('ERR:' + $env:WINDOWS_SANDBOX_TEST_FLAG); " +
-		"if ((Get-Location).Path -ne " + psQuote(workspace) + ") { exit 7 }; " +
+		"try { Set-Content -LiteralPath 'cwd-marker.txt' -Value cwd } catch { exit 7 }; " +
 		"if ((Split-Path -Leaf $env:TEMP) -notlike 'windows-sandbox-test-*') { exit 8 }; " +
 		"exit 23"
 	result, err := Run(
@@ -354,6 +355,9 @@ func TestWindowsSandboxStdioEnvDirAndExitCode(t *testing.T) {
 	}
 	if got := readWholeFile(t, stderr.Name()); !strings.Contains(got, "ERR:flag-from-env") {
 		t.Fatalf("stderr = %q, want env echo", got)
+	}
+	if got, err := os.ReadFile(cwdMarker); err != nil || !strings.Contains(string(got), "cwd") {
+		t.Fatalf("cwd marker missing: %q err=%v", got, err)
 	}
 }
 
