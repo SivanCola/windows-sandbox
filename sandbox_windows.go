@@ -70,6 +70,14 @@ func runWindowsSandboxed(spec Spec, argv []string, opts RunOptions) (int, error)
 	if spec.Writable {
 		return runWindowsRestrictedSandboxed(spec, argv, opts)
 	}
+	// Serialize against concurrent runs touching the same roots and clear any
+	// deny residue left by a crashed run before we mutate ACLs.
+	lock, err := lockWindowsRoots(windowsMutatedRoots(spec))
+	if err != nil {
+		return 0, err
+	}
+	defer lock.release()
+	sweepWindowsDenyResidue()
 	ac, err := prepareAppContainer(spec)
 	if err != nil {
 		return 0, err
@@ -134,6 +142,17 @@ func runWindowsSandboxed(spec Spec, argv []string, opts RunOptions) (int, error)
 }
 
 func runWindowsRestrictedSandboxed(spec Spec, argv []string, opts RunOptions) (int, error) {
+	if !spec.Network {
+		return 0, fmt.Errorf("network=false is not available for writable Windows sandbox commands")
+	}
+	// Serialize against concurrent runs touching the same roots and clear any
+	// deny residue left by a crashed run before we mutate ACLs.
+	lock, err := lockWindowsRoots(windowsMutatedRoots(spec))
+	if err != nil {
+		return 0, err
+	}
+	defer lock.release()
+	sweepWindowsDenyResidue()
 	tempRoot, cleanupTemp, err := windowsSandboxTempRoot(spec)
 	if err != nil {
 		return 0, err
@@ -153,9 +172,6 @@ func runWindowsRestrictedSandboxed(spec Spec, argv []string, opts RunOptions) (i
 		return 0, err
 	}
 	defer cleanupExe()
-	if !spec.Network {
-		return 0, fmt.Errorf("network=false is not available for writable Windows sandbox commands")
-	}
 
 	token, err := createLowIntegrityPrimaryToken()
 	if err != nil {
@@ -569,7 +585,7 @@ func grantAppContainerFilesystem(sid *windows.SID, spec Spec, extraWritableRoots
 	writableSIDStrs := appContainerWritableAccessSIDStrings(sid)
 	var cleanup []func()
 	for _, root := range windowsWritableRoots(spec, extraWritableRoots...) {
-		restore, hasLabelSnapshot, err := snapshotPathSecurity(root, spec.Writable)
+		restore, _, err := snapshotPathSecurity(root, spec.Writable)
 		if err != nil {
 			runCleanup(cleanup)()
 			return func() {}, err
@@ -590,15 +606,29 @@ func grantAppContainerFilesystem(sid *windows.SID, spec Spec, extraWritableRoots
 				runCleanup(cleanup)()
 				return func() {}, err
 			}
-			if !hasLabelSnapshot {
-				restoreLabel = func() { _ = icacls(root, "/setintegritylevel", "(OI)(CI)M", "/C") }
-			}
+			// setLowIntegrity stamps an *explicit* Low integrity label on every
+			// descendant via `/T`, but the DACL/label snapshot only captures the
+			// root. Without a recursive reset the subtree keeps its Low label
+			// after cleanup, so any low-integrity process on the host (a browser
+			// renderer, say) could write into the user's files later — a durable
+			// security regression. Always recursively reset the subtree to Medium
+			// on cleanup so no Low residue survives. The root's own label is
+			// restored from the snapshot first; resetting it to explicit Medium
+			// afterward is harmless because Medium is the default effective level
+			// for user files.
+			restoreLabel = func() { _ = icacls(root, "/setintegritylevel", "(OI)(CI)M", "/T", "/C") }
 		}
 		removeAdded := func() { removeGrantedAppContainerSIDs(root, writableSIDStrs) }
 		cleanup[restoreIndex] = cleanupPathSecurity(restore, removeAdded, restoreLabel)
 	}
+	var deniedPaths []string
 	for _, root := range normalizedWindowsRoots(spec.ForbidReadRoots) {
-		if !dirExists(root) {
+		// forbid_read must also cover single files (e.g. ~/.netrc, .npmrc), not
+		// just directories. Skip only truly-absent paths; deny ACEs apply to
+		// files as well as directories. pathExists distinguishes "missing" from
+		// "is a file", so a forbid_read entry pointing at a real file is still
+		// protected instead of being silently ignored.
+		if !pathExists(root) {
 			continue
 		}
 		restore, _, err := snapshotPathSecurity(root, false)
@@ -609,14 +639,28 @@ func grantAppContainerFilesystem(sid *windows.SID, spec Spec, extraWritableRoots
 		cleanup = append(cleanup, restore)
 		restoreIndex := len(cleanup) - 1
 		denySIDStrs := forbidReadDenySIDStrings(objectSIDStrs)
-		if err := denyAppContainerSIDs(root, denySIDStrs, "RX"); err != nil {
+		// Directories need inheritance so the deny covers existing and new
+		// children; a plain file has no children, so inheritance flags are
+		// meaningless (and icacls rejects (OI)(CI) on a file).
+		if err := denyAppContainerSIDsWithInheritance(root, denySIDStrs, "RX", dirExists(root)); err != nil {
 			runCleanup(cleanup)()
 			return func() {}, err
 		}
+		deniedPaths = append(deniedPaths, root)
 		removeAdded := func() { removeDeniedAppContainerSIDs(root, denySIDStrs) }
 		cleanup[restoreIndex] = cleanupPathSecurity(restore, removeAdded, nil)
 	}
-	return runCleanup(cleanup), nil
+	// The forbid_read deny ACEs include the current user's SID, so a crash that
+	// skips cleanup would lock the user out of their own paths (e.g. ~/.ssh).
+	// Record them so a later run can sweep the residue if this process dies; the
+	// marker is dropped only after our own cleanup removes the ACEs.
+	recordWindowsDenyResidue(deniedPaths)
+	return func() {
+		runCleanup(cleanup)()
+		if len(deniedPaths) > 0 {
+			clearWindowsDenyResidueMarker()
+		}
+	}, nil
 }
 
 func forbidReadDenySIDStrings(base []string) []string {
@@ -880,11 +924,66 @@ func runCleanup(cleanup []func()) func() {
 	}
 }
 
+// icacls default timeouts. The non-recursive default is generous because
+// icacls can be slow on busy or antivirus-scanned volumes; the recursive
+// default is far larger because `/T` walks the whole subtree, and a large
+// workspace (e.g. one with node_modules) can take much longer than a few
+// seconds. Both are overridable through WINDOWS_SANDBOX_ICACLS_TIMEOUT_MS so
+// operators on pathological trees can raise the ceiling without a rebuild.
+const (
+	defaultICACLSTimeout          = 30 * time.Second
+	defaultICACLSRecursiveTimeout = 10 * time.Minute
+)
+
+// systemRootTool resolves a Windows system tool to its absolute path under
+// %SystemRoot%\System32 so the sandbox never invokes a PATH-resolved binary
+// (which an attacker who controls the workspace or environment could shadow).
+// It falls back to the bare name only when the expected file is missing, so
+// oddly-configured hosts still function instead of failing outright.
+func systemRootTool(name string) string {
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = os.Getenv("windir")
+	}
+	if root == "" {
+		root = `C:\Windows`
+	}
+	full := filepath.Join(root, "System32", name)
+	if _, err := os.Stat(full); err == nil {
+		return full
+	}
+	return name
+}
+
+// windowsICACLSTimeout returns the configured icacls timeout, honoring
+// WINDOWS_SANDBOX_ICACLS_TIMEOUT_MS when set to a positive value and otherwise
+// falling back to the caller-provided default.
+func windowsICACLSTimeout(fallback time.Duration) time.Duration {
+	if raw := os.Getenv("WINDOWS_SANDBOX_ICACLS_TIMEOUT_MS"); raw != "" {
+		if ms, err := strconv.ParseUint(raw, 10, 63); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return fallback
+}
+
+// icaclsTimeoutForArgs picks the recursive budget whenever the invocation
+// includes `/T`, so any recursive operation automatically gets the larger
+// ceiling without every call site having to know.
+func icaclsTimeoutForArgs(args []string) time.Duration {
+	for _, a := range args {
+		if strings.EqualFold(a, "/T") {
+			return windowsICACLSTimeout(defaultICACLSRecursiveTimeout)
+		}
+	}
+	return windowsICACLSTimeout(defaultICACLSTimeout)
+}
+
 func icacls(root string, args ...string) error {
 	all := append([]string{root}, args...)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), icaclsTimeoutForArgs(args))
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "icacls", all...)
+	cmd := exec.CommandContext(ctx, systemRootTool("icacls.exe"), all...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -901,7 +1000,7 @@ func icacls(root string, args ...string) error {
 		return nil
 	case <-ctx.Done():
 		if cmd.Process != nil {
-			_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+			_ = exec.Command(systemRootTool("taskkill.exe"), "/T", "/F", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
 			_ = cmd.Process.Kill()
 		}
 		select {
@@ -931,11 +1030,15 @@ func grantAppContainerSIDs(root string, sidStrs []string, perm string) error {
 }
 
 func denyAppContainerSIDs(root string, sidStrs []string, perm string) error {
+	return denyAppContainerSIDsWithInheritance(root, sidStrs, perm, true)
+}
+
+func denyAppContainerSIDsWithInheritance(root string, sidStrs []string, perm string, includeInheritance bool) error {
 	mask, err := windowsACLAccessMask(perm)
 	if err != nil {
 		return err
 	}
-	return applyWindowsACLEntries(root, sidStrs, windows.DENY_ACCESS, mask, true)
+	return applyWindowsACLEntries(root, sidStrs, windows.DENY_ACCESS, mask, includeInheritance)
 }
 
 func windowsACLAccessMask(perm string) (windows.ACCESS_MASK, error) {
@@ -1155,4 +1258,12 @@ func sameWindowsRoot(a, b string) bool {
 func dirExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
+}
+
+// pathExists reports whether path exists at all (file or directory). forbid_read
+// entries may point at single files, so directory-only checks would silently
+// skip them.
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
