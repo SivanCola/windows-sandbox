@@ -183,15 +183,54 @@ func windowsMutatedRoots(spec Spec) []string {
 	return roots
 }
 
+// windowsMutatedRootsForRun extends windowsMutatedRoots with the executable
+// directories the run will grant on, but only the *user-writable* ones. A run
+// snapshots/grants/restores argv[0]'s directory (and a Git install root), so two
+// runs in different workspaces that share one user-writable tool directory would
+// otherwise interleave their ACL snapshots and corrupt each other. System tool
+// directories (System32, Program Files) are not user-writable — the grant there
+// no-ops and is skipped — and must be left out of the lock, or every command
+// sharing the system shell would needlessly serialize. Only writable exe dirs
+// are both actually mutated and a real contention point, so only those join the
+// lock.
+func windowsMutatedRootsForRun(spec Spec, exe string) []string {
+	roots := windowsMutatedRoots(spec)
+	for _, dir := range windowsExecutableGrantRoots(exe) {
+		if windowsPathUserWritable(dir) {
+			roots = append(roots, dir)
+		}
+	}
+	return roots
+}
+
 // forbid_read applies a deny ACE for the current user SID so a same-user
-// low-integrity child cannot bypass the deny through normal file ACLs. That ACE
-// is removed on normal cleanup, but a crash (or force-kill) skips cleanup and
-// leaves the user denied read on, e.g., ~/.ssh — locking their editor and git
-// out until they repair the ACL by hand. The deny-residue tracker records which
-// paths a run denied in a per-PID marker file; the next run sweeps markers whose
-// owning process is gone and removes the lingering deny ACEs. Only deny ACEs for
-// the stable, sandbox-applied trustees are removed, so legitimate ACLs are left
-// untouched.
+// low-integrity child cannot bypass the deny through normal file ACLs, and
+// writable runs grant AppContainer/user read+execute on the tool executable's
+// directory. Both are removed on normal cleanup, but a crash (or force-kill)
+// skips cleanup and leaves residue: a deny ACE locks the user out of, e.g.,
+// ~/.ssh until they repair the ACL by hand; a stale grant silently widens read
+// access to a tool directory. The residue tracker records each mutated path in a
+// per-PID marker *before* the ACE is applied, so any crash point leaves a marker
+// the next run can sweep; the next run removes the residue for markers whose
+// owning process is gone. Only the stable, sandbox-applied trustees are removed,
+// so legitimate ACLs are left untouched.
+//
+// Each marker line is "<kind> <path>", where kind is "deny" or "grant". Lines
+// are appended and fsync'd one at a time, and a write failure aborts the run
+// before the corresponding ACE is applied, so the marker can never lag behind
+// the on-disk ACLs.
+
+type residueKind string
+
+const (
+	residueDeny  residueKind = "deny"
+	residueGrant residueKind = "grant"
+)
+
+type residueEntry struct {
+	kind residueKind
+	path string
+}
 
 func windowsDenyMarkerDir() string {
 	return filepath.Join(os.TempDir(), "windows-sandbox-denylocks")
@@ -201,34 +240,41 @@ func windowsDenyMarkerPath() string {
 	return filepath.Join(windowsDenyMarkerDir(), strconv.Itoa(os.Getpid())+".txt")
 }
 
-// recordWindowsDenyResidue notes that this process applied deny ACEs to paths so
-// a later run can clean them up if this process dies before its own cleanup.
-func recordWindowsDenyResidue(paths []string) {
-	if len(paths) == 0 {
-		return
-	}
+// recordResidueBeforeApply appends one "<kind>\t<path>" line to this process's
+// marker and flushes it to disk. It is called immediately before the matching
+// ACE is applied; a failure here must abort the run before the ACE is applied so
+// the marker never lags the on-disk ACLs. Returns an error so the caller can
+// fail closed. A tab separates the fields because Windows paths never contain
+// one, so the path is recovered unambiguously regardless of spaces in it.
+func recordResidueBeforeApply(kind residueKind, path string) error {
 	dir := windowsDenyMarkerDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return
+		return fmt.Errorf("create residue marker dir: %w", err)
 	}
-	var b strings.Builder
-	for _, p := range paths {
-		b.WriteString(p)
-		b.WriteByte('\n')
+	f, err := os.OpenFile(windowsDenyMarkerPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open residue marker: %w", err)
 	}
-	_ = os.WriteFile(windowsDenyMarkerPath(), []byte(b.String()), 0o600)
+	defer f.Close()
+	if _, err := f.WriteString(string(kind) + "\t" + path + "\n"); err != nil {
+		return fmt.Errorf("write residue marker: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync residue marker: %w", err)
+	}
+	return nil
 }
 
 // clearWindowsDenyResidueMarker drops this process's marker after its own
-// cleanup has removed the deny ACEs.
+// cleanup has removed every recorded ACE.
 func clearWindowsDenyResidueMarker() {
 	_ = os.Remove(windowsDenyMarkerPath())
 }
 
-// sweepWindowsDenyResidue removes deny ACEs left by crashed runs. It only acts
-// on markers whose owning PID is no longer alive, and only removes the stable
-// sandbox-applied deny trustees, so it never disturbs a live run or a
-// legitimate ACL. Best-effort: any error is ignored so it can never block a run.
+// sweepWindowsDenyResidue removes ACEs left by crashed runs. It only acts on
+// markers whose owning PID is no longer alive, and only removes the stable
+// sandbox-applied trustees, so it never disturbs a live run or a legitimate ACL.
+// Best-effort: any error is ignored so it can never block a run.
 func sweepWindowsDenyResidue() {
 	dir := windowsDenyMarkerDir()
 	entries, err := os.ReadDir(dir)
@@ -236,7 +282,9 @@ func sweepWindowsDenyResidue() {
 		return
 	}
 	userSID, _ := currentProcessUserSIDString()
-	denySIDs := dedupeSIDStrings([]string{
+	// The sandbox only ever applies these trustees, for both grants and denies,
+	// so removing exactly them cannot disturb a legitimate ACL.
+	sandboxSIDs := dedupeSIDStrings([]string{
 		allApplicationPackagesSID,
 		allRestrictedApplicationPackagesSID,
 		userSID,
@@ -251,26 +299,46 @@ func sweepWindowsDenyResidue() {
 			continue
 		}
 		markerPath := filepath.Join(dir, entry.Name())
-		for _, path := range readWindowsDenyMarker(markerPath) {
-			if pathExists(path) {
-				removeDeniedAppContainerSIDs(path, denySIDs)
+		for _, e := range readResidueMarker(markerPath) {
+			if !pathExists(e.path) {
+				continue
+			}
+			switch e.kind {
+			case residueDeny:
+				removeDeniedAppContainerSIDs(e.path, sandboxSIDs)
+			case residueGrant:
+				removeGrantedAppContainerSIDs(e.path, sandboxSIDs)
 			}
 		}
 		_ = os.Remove(markerPath)
 	}
 }
 
-func readWindowsDenyMarker(path string) []string {
+// readResidueMarker parses "<kind>\t<path>" lines. A tab splits the fields so a
+// path containing spaces is preserved intact. An unrecognized line is skipped
+// rather than guessed at, so a corrupt marker cannot cause a wrong ACE removal.
+func readResidueMarker(path string) []residueEntry {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
-	var out []string
+	var out []residueEntry
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		if line := strings.TrimSpace(scanner.Text()); line != "" {
-			out = append(out, line)
+		line := strings.TrimRight(scanner.Text(), "\r\n")
+		if line == "" {
+			continue
+		}
+		kindStr, p, ok := strings.Cut(line, "\t")
+		if !ok || p == "" {
+			continue
+		}
+		switch residueKind(kindStr) {
+		case residueDeny:
+			out = append(out, residueEntry{kind: residueDeny, path: p})
+		case residueGrant:
+			out = append(out, residueEntry{kind: residueGrant, path: p})
 		}
 	}
 	return out
@@ -295,4 +363,24 @@ func windowsProcessAlive(pidStr string) bool {
 		return false
 	}
 	return code == stillActiveExitCode
+}
+
+// windowsPathUserWritable reports whether dir is writable by the current user,
+// tested by actually creating and removing a probe file. This is more reliable
+// than parsing the DACL (effective access depends on group membership,
+// inherited ACEs, and integrity level) and mirrors what the grant path itself
+// will do. A non-existent or non-writable directory returns false, so it is left
+// out of the lock and the grant simply no-ops there.
+func windowsPathUserWritable(dir string) bool {
+	if !dirExists(dir) {
+		return false
+	}
+	f, err := os.CreateTemp(dir, ".windows-sandbox-writable-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return true
 }

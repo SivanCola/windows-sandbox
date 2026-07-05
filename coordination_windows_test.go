@@ -135,7 +135,7 @@ func TestWindowsRootLockMultiRootNoSelfDeadlock(t *testing.T) {
 	lock.release()
 }
 
-func TestWindowsDenyResidueRoundTrip(t *testing.T) {
+func TestWindowsResidueMarkerIncrementalRoundTrip(t *testing.T) {
 	// Redirect the marker dir into a temp dir so the test never touches the real
 	// %TEMP%. windowsDenyMarkerDir derives from os.TempDir, so overriding TMP is
 	// enough on Windows.
@@ -143,26 +143,126 @@ func TestWindowsDenyResidueRoundTrip(t *testing.T) {
 	t.Setenv("TMP", tmp)
 	t.Setenv("TEMP", tmp)
 
-	paths := []string{`C:\Users\me\.ssh`, `C:\Users\me\.netrc`}
-	recordWindowsDenyResidue(paths)
+	// Append entries one at a time, as the run does before applying each ACE.
+	if err := recordResidueBeforeApply(residueDeny, `C:\Users\me\.ssh`); err != nil {
+		t.Fatalf("record deny: %v", err)
+	}
+	if err := recordResidueBeforeApply(residueGrant, `C:\Users\me\tools`); err != nil {
+		t.Fatalf("record grant: %v", err)
+	}
 
 	marker := windowsDenyMarkerPath()
 	if !pathExists(marker) {
 		t.Fatalf("marker not written at %s", marker)
 	}
-	got := readWindowsDenyMarker(marker)
-	if len(got) != len(paths) {
-		t.Fatalf("marker round-trip = %v, want %v", got, paths)
+	got := readResidueMarker(marker)
+	want := []residueEntry{
+		{kind: residueDeny, path: `C:\Users\me\.ssh`},
+		{kind: residueGrant, path: `C:\Users\me\tools`},
 	}
-	for i := range paths {
-		if got[i] != paths[i] {
-			t.Fatalf("marker[%d] = %q, want %q", i, got[i], paths[i])
+	if len(got) != len(want) {
+		t.Fatalf("marker round-trip = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("marker[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
 
 	clearWindowsDenyResidueMarker()
 	if pathExists(marker) {
 		t.Fatal("marker not cleared")
+	}
+}
+
+func TestWindowsResidueMarkerSkipsMalformedLines(t *testing.T) {
+	// A corrupt or unrecognized marker line must be skipped, never guessed at, so
+	// a damaged marker cannot drive a wrong ACE removal.
+	tmp := t.TempDir()
+	t.Setenv("TMP", tmp)
+	t.Setenv("TEMP", tmp)
+	if err := os.MkdirAll(windowsDenyMarkerDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := windowsDenyMarkerPath()
+	content := "deny\tC:\\Users\\me\\.ssh\n" + // valid
+		"garbage-no-tab\n" + // no separator
+		"boguskind\tC:\\x\n" + // unknown kind
+		"grant\t\n" + // empty path
+		"grant\tC:\\Users\\me\\my tools\n" // valid, path with a space
+	if err := os.WriteFile(marker, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := readResidueMarker(marker)
+	want := []residueEntry{
+		{kind: residueDeny, path: `C:\Users\me\.ssh`},
+		{kind: residueGrant, path: `C:\Users\me\my tools`},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parsed = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("entry %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestWindowsResidueMarkerWriteFailurePropagates(t *testing.T) {
+	// If the marker cannot be created, recordResidueBeforeApply must return an
+	// error so the caller fails closed instead of applying an untracked ACE. Point
+	// TMP at a path that is a file, so MkdirAll of the marker dir underneath it
+	// fails.
+	tmp := t.TempDir()
+	fileAsTemp := filepath.Join(tmp, "not-a-dir")
+	if err := os.WriteFile(fileAsTemp, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMP", fileAsTemp)
+	t.Setenv("TEMP", fileAsTemp)
+	if err := recordResidueBeforeApply(residueDeny, `C:\Users\me\.ssh`); err == nil {
+		t.Fatal("expected error when the marker directory cannot be created")
+	}
+}
+
+func TestWindowsMutatedRootsForRunLocksWritableExeDirOnly(t *testing.T) {
+	workspace := t.TempDir()
+	// A user-writable tool directory must join the lock set; a Windows system
+	// directory (not user-writable) must not, or commands sharing the system
+	// shell would needlessly serialize.
+	writableToolDir := t.TempDir()
+	toolExe := filepath.Join(writableToolDir, "mytool.exe")
+	if err := os.WriteFile(toolExe, []byte("not really an exe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := windowsMutatedRootsForRun(Spec{WritableRoots: []string{workspace}, Writable: true}, toolExe)
+	if !containsWindowsPath(got, workspace) {
+		t.Fatalf("mutated roots = %v, want workspace", got)
+	}
+	if !containsWindowsPath(got, writableToolDir) {
+		t.Fatalf("mutated roots = %v, want writable tool dir %s", got, writableToolDir)
+	}
+
+	// A system executable's directory (System32) is not user-writable and must be
+	// excluded. Resolve a real system tool to avoid depending on PATH layout.
+	sysExe := systemRootTool("icacls.exe")
+	if !filepath.IsAbs(sysExe) {
+		t.Skip("no absolute system tool to test the non-writable exclusion")
+	}
+	sysRoots := windowsMutatedRootsForRun(Spec{WritableRoots: []string{workspace}, Writable: true}, sysExe)
+	if containsWindowsPath(sysRoots, filepath.Dir(sysExe)) {
+		t.Fatalf("system exe dir %s must not join the lock set: %v", filepath.Dir(sysExe), sysRoots)
+	}
+}
+
+func TestWindowsPathUserWritable(t *testing.T) {
+	writable := t.TempDir()
+	if !windowsPathUserWritable(writable) {
+		t.Fatalf("temp dir %s should be user-writable", writable)
+	}
+	if windowsPathUserWritable(filepath.Join(writable, "does-not-exist")) {
+		t.Fatal("a missing directory must not be reported writable")
 	}
 }
 
@@ -293,6 +393,75 @@ func TestWindowsSandboxConcurrentWritesToSharedWorkspace(t *testing.T) {
 	// After all runs the workspace must carry no leftover Low integrity label or
 	// sandbox deny ACE.
 	assertNoWindowsSandboxACEForTest(t, workspace)
+}
+
+// TestWindowsSandboxConcurrentDistinctWorkspacesSharedToolDir is the P2
+// regression: two runs in *different* workspaces (so their workspace locks do
+// not collide) that invoke a tool from one shared user-writable directory. That
+// shared exe directory is snapshot/grant/restored by each run, so without
+// folding it into the lock the two runs would interleave their ACL snapshots and
+// one could fail or leave a stale grant. Both must succeed and the shared tool
+// directory must carry no leftover sandbox ACE.
+func TestWindowsSandboxConcurrentDistinctWorkspacesSharedToolDir(t *testing.T) {
+	if !Available() {
+		t.Skip("windows sandbox APIs unavailable")
+	}
+	sh := powershellArgvForTest(t, "")
+	if sh == nil {
+		t.Skip("PowerShell unavailable")
+	}
+	// A shared, user-writable tool directory holding a copy of the shell. Each
+	// concurrent run resolves argv[0] into this directory, so the runs contend on
+	// it even though their workspaces differ.
+	toolDir := t.TempDir()
+	sharedTool := filepath.Join(toolDir, "sandbox-shared-tool.exe")
+	if err := copyFileForTest(t, sh[0], sharedTool); err != nil {
+		t.Skipf("cannot stage shared tool: %v", err)
+	}
+	toolArgv := append([]string{sharedTool}, sh[1:]...)
+
+	const n = 4
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			workspace := t.TempDir() // distinct per run: workspace locks do not collide
+			target := filepath.Join(workspace, "out.txt")
+			script := "$ErrorActionPreference='Stop'; Set-Content -LiteralPath " + psQuote(target) + " -Value ok"
+			result, err := Run(
+				Spec{WritableRoots: []string{workspace}, Network: true, Writable: true, TempPrefix: "windows-sandbox-test-"},
+				append(toolArgv, script),
+				RunOptions{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr},
+			)
+			if err != nil {
+				errs[idx] = err
+				return
+			}
+			if result.ExitCode != 0 {
+				errs[idx] = errExitf(idx, result.ExitCode)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("concurrent run %d sharing tool dir failed: %v", i, errs[i])
+		}
+	}
+	// The shared tool directory must be left with no sandbox grant residue.
+	assertNoWindowsSandboxACEForTest(t, toolDir)
+}
+
+func copyFileForTest(t *testing.T, src, dst string) error {
+	t.Helper()
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o755)
 }
 
 func contains(haystack []string, needle string) bool {

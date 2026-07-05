@@ -72,12 +72,16 @@ func runWindowsSandboxed(spec Spec, argv []string, opts RunOptions) (int, error)
 	}
 	// Serialize against concurrent runs touching the same roots and clear any
 	// deny residue left by a crashed run before we mutate ACLs.
-	lock, err := lockWindowsRoots(windowsMutatedRoots(spec))
+	lock, err := lockWindowsRoots(windowsMutatedRootsForRun(spec, argv[0]))
 	if err != nil {
 		return 0, err
 	}
 	defer lock.release()
 	sweepWindowsDenyResidue()
+	// Clear this run's residue marker last — after every grant/deny cleanup below
+	// has run — so a crash at any point leaves a marker covering all ACEs still on
+	// disk. Registered before the cleanup defers so it executes after them (LIFO).
+	defer clearWindowsDenyResidueMarker()
 	ac, err := prepareAppContainer(spec)
 	if err != nil {
 		return 0, err
@@ -147,12 +151,16 @@ func runWindowsRestrictedSandboxed(spec Spec, argv []string, opts RunOptions) (i
 	}
 	// Serialize against concurrent runs touching the same roots and clear any
 	// deny residue left by a crashed run before we mutate ACLs.
-	lock, err := lockWindowsRoots(windowsMutatedRoots(spec))
+	lock, err := lockWindowsRoots(windowsMutatedRootsForRun(spec, argv[0]))
 	if err != nil {
 		return 0, err
 	}
 	defer lock.release()
 	sweepWindowsDenyResidue()
+	// Clear this run's residue marker last — after every grant/deny cleanup below
+	// has run — so a crash at any point leaves a marker covering all ACEs still on
+	// disk. Registered before the cleanup defers so it executes after them (LIFO).
+	defer clearWindowsDenyResidueMarker()
 	tempRoot, cleanupTemp, err := windowsSandboxTempRoot(spec)
 	if err != nil {
 		return 0, err
@@ -621,7 +629,6 @@ func grantAppContainerFilesystem(sid *windows.SID, spec Spec, extraWritableRoots
 		removeAdded := func() { removeGrantedAppContainerSIDs(root, writableSIDStrs) }
 		cleanup[restoreIndex] = cleanupPathSecurity(restore, removeAdded, restoreLabel)
 	}
-	var deniedPaths []string
 	for _, root := range normalizedWindowsRoots(spec.ForbidReadRoots) {
 		// forbid_read must also cover single files (e.g. ~/.netrc, .npmrc), not
 		// just directories. Skip only truly-absent paths; deny ACEs apply to
@@ -639,6 +646,15 @@ func grantAppContainerFilesystem(sid *windows.SID, spec Spec, extraWritableRoots
 		cleanup = append(cleanup, restore)
 		restoreIndex := len(cleanup) - 1
 		denySIDStrs := forbidReadDenySIDStrings(objectSIDStrs)
+		// Record the deny in the crash-residue marker *before* applying it, and
+		// fail closed if the marker cannot be written. Otherwise a crash between
+		// applying the deny and recording it — or a silent marker write failure —
+		// would leave the user's SID denied on this path with no marker for the
+		// next run to sweep, locking them out of e.g. ~/.ssh permanently.
+		if err := recordResidueBeforeApply(residueDeny, root); err != nil {
+			runCleanup(cleanup)()
+			return func() {}, err
+		}
 		// Directories need inheritance so the deny covers existing and new
 		// children; a plain file has no children, so inheritance flags are
 		// meaningless (and icacls rejects (OI)(CI) on a file).
@@ -646,21 +662,12 @@ func grantAppContainerFilesystem(sid *windows.SID, spec Spec, extraWritableRoots
 			runCleanup(cleanup)()
 			return func() {}, err
 		}
-		deniedPaths = append(deniedPaths, root)
 		removeAdded := func() { removeDeniedAppContainerSIDs(root, denySIDStrs) }
 		cleanup[restoreIndex] = cleanupPathSecurity(restore, removeAdded, nil)
 	}
-	// The forbid_read deny ACEs include the current user's SID, so a crash that
-	// skips cleanup would lock the user out of their own paths (e.g. ~/.ssh).
-	// Record them so a later run can sweep the residue if this process dies; the
-	// marker is dropped only after our own cleanup removes the ACEs.
-	recordWindowsDenyResidue(deniedPaths)
-	return func() {
-		runCleanup(cleanup)()
-		if len(deniedPaths) > 0 {
-			clearWindowsDenyResidueMarker()
-		}
-	}, nil
+	// The residue marker is written incrementally above and cleared centrally by
+	// the run once every cleanup (filesystem and executable) has completed.
+	return runCleanup(cleanup), nil
 }
 
 func forbidReadDenySIDStrings(base []string) []string {
@@ -682,6 +689,14 @@ func grantAppContainerExecutable(sid *windows.SID, exe string) (func(), error) {
 		if err != nil {
 			continue
 		}
+		// Record the grant before applying it so a crash cannot leave a widened
+		// tool-directory ACL with no marker for the next run to sweep. A marker
+		// write failure aborts this dir's grant (restore and skip) rather than
+		// applying an untracked grant.
+		if err := recordResidueBeforeApply(residueGrant, dir); err != nil {
+			restore()
+			continue
+		}
 		if err := grantAppContainerSIDs(dir, objectSIDStrs, "RX"); err != nil {
 			restore()
 			continue
@@ -689,9 +704,7 @@ func grantAppContainerExecutable(sid *windows.SID, exe string) (func(), error) {
 		removeAdded := func() { removeGrantedAppContainerSIDs(dir, objectSIDStrs) }
 		cleanup = append(cleanup, cleanupPathSecurity(restore, removeAdded, nil))
 	}
-	if len(cleanup) == 0 {
-		return func() {}, nil
-	}
+	// The residue marker is cleared centrally by the run after all cleanups.
 	return runCleanup(cleanup), nil
 }
 
