@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,8 +49,18 @@ const defaultWindowsRootLockTimeout = 10 * time.Minute
 // process is running. Used to tell a live marker-owner from a dead one.
 const stillActiveExitCode = 259
 
+// Windows mutexes have thread affinity: the thread that acquires a mutex is the
+// only one that can release it (ReleaseMutex from another thread fails with
+// ERROR_NOT_OWNER), and the owning thread re-acquiring is a no-op that would
+// break serialization within a process. A Go goroutine can migrate across OS
+// threads between the acquire and the deferred release, so the lock pins itself
+// to one OS thread for its whole lifetime with runtime.LockOSThread and unpins
+// on release. This keeps ReleaseMutex on the owning thread and prevents a
+// concurrent goroutine that happens to land on the owner thread from re-entering
+// the mutex.
 type windowsRootLock struct {
 	handles []windows.Handle
+	pinned  bool
 }
 
 func windowsRootLockTimeout() time.Duration {
@@ -64,9 +75,17 @@ func windowsRootLockTimeout() time.Duration {
 // lockWindowsRoots serializes access to every distinct root in roots. The
 // returned lock must be released once the run's grants have been cleaned up.
 func lockWindowsRoots(roots []string) (*windowsRootLock, error) {
+	names := windowsRootLockNames(roots)
+	if len(names) == 0 {
+		return &windowsRootLock{}, nil
+	}
 	lock := &windowsRootLock{}
+	// Pin before acquiring the first mutex and stay pinned until release so every
+	// mutex is owned by, and released from, the same OS thread.
+	runtime.LockOSThread()
+	lock.pinned = true
 	timeout := windowsRootLockTimeout()
-	for _, name := range windowsRootLockNames(roots) {
+	for _, name := range names {
 		h, err := acquireNamedMutex(name, timeout)
 		if err != nil {
 			lock.release()
@@ -90,6 +109,10 @@ func (l *windowsRootLock) release() {
 		_ = windows.CloseHandle(h)
 	}
 	l.handles = nil
+	if l.pinned {
+		runtime.UnlockOSThread()
+		l.pinned = false
+	}
 }
 
 // windowsRootLockNames maps roots to a deduplicated, sorted list of mutex

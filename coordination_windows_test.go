@@ -88,14 +88,37 @@ func TestWindowsRootLockTimesOutWhenHeld(t *testing.T) {
 	}
 	defer held.release()
 
-	start := time.Now()
-	if _, err := lockWindowsRoots([]string{root}); err == nil {
-		t.Fatal("expected timeout acquiring a held lock")
-	} else if !strings.Contains(err.Error(), "timed out") {
-		t.Fatalf("error = %v, want timeout", err)
+	// The contender must run on its own goroutine, not the holder's: a Windows
+	// mutex is recursive for its owning OS thread, so re-acquiring from the same
+	// thread would succeed instead of timing out. The holder pins its thread, so
+	// the contender goroutine lands on a different thread and genuinely blocks.
+	type result struct {
+		err     error
+		elapsed time.Duration
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("lock timeout took too long: %s", elapsed)
+	done := make(chan result, 1)
+	go func() {
+		start := time.Now()
+		lock, err := lockWindowsRoots([]string{root})
+		if lock != nil {
+			lock.release()
+		}
+		done <- result{err: err, elapsed: time.Since(start)}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err == nil {
+			t.Fatal("expected timeout acquiring a held lock")
+		}
+		if !strings.Contains(r.err.Error(), "timed out") {
+			t.Fatalf("error = %v, want timeout", r.err)
+		}
+		if r.elapsed > 2*time.Second {
+			t.Fatalf("lock timeout took too long: %s", r.elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("contender never returned")
 	}
 }
 
