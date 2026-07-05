@@ -78,10 +78,11 @@ func runWindowsSandboxed(spec Spec, argv []string, opts RunOptions) (int, error)
 	}
 	defer lock.release()
 	sweepWindowsDenyResidue()
+	residueRun := newWindowsDenyResidueRun()
 	// Clear this run's residue marker last — after every grant/deny cleanup below
 	// has run — so a crash at any point leaves a marker covering all ACEs still on
 	// disk. Registered before the cleanup defers so it executes after them (LIFO).
-	defer clearWindowsDenyResidueMarker()
+	defer residueRun.clear()
 	ac, err := prepareAppContainer(spec)
 	if err != nil {
 		return 0, err
@@ -92,12 +93,12 @@ func runWindowsSandboxed(spec Spec, argv []string, opts RunOptions) (int, error)
 		return 0, err
 	}
 	defer cleanupTemp()
-	cleanupFS, err := grantAppContainerFilesystem(ac.sid, spec, tempRoot)
+	cleanupFS, err := grantAppContainerFilesystem(residueRun, ac.sid, spec, tempRoot)
 	if err != nil {
 		return 0, err
 	}
 	defer cleanupFS()
-	cleanupExe, err := grantAppContainerExecutable(ac.sid, argv[0])
+	cleanupExe, err := grantAppContainerExecutable(residueRun, ac.sid, argv[0])
 	if err != nil {
 		return 0, err
 	}
@@ -157,10 +158,11 @@ func runWindowsRestrictedSandboxed(spec Spec, argv []string, opts RunOptions) (i
 	}
 	defer lock.release()
 	sweepWindowsDenyResidue()
+	residueRun := newWindowsDenyResidueRun()
 	// Clear this run's residue marker last — after every grant/deny cleanup below
 	// has run — so a crash at any point leaves a marker covering all ACEs still on
 	// disk. Registered before the cleanup defers so it executes after them (LIFO).
-	defer clearWindowsDenyResidueMarker()
+	defer residueRun.clear()
 	tempRoot, cleanupTemp, err := windowsSandboxTempRoot(spec)
 	if err != nil {
 		return 0, err
@@ -170,12 +172,12 @@ func runWindowsRestrictedSandboxed(spec Spec, argv []string, opts RunOptions) (i
 	if err != nil {
 		return 0, err
 	}
-	cleanupFS, err := grantAppContainerFilesystem(userSID, spec, tempRoot)
+	cleanupFS, err := grantAppContainerFilesystem(residueRun, userSID, spec, tempRoot)
 	if err != nil {
 		return 0, err
 	}
 	defer cleanupFS()
-	cleanupExe, err := grantAppContainerExecutable(userSID, argv[0])
+	cleanupExe, err := grantAppContainerExecutable(residueRun, userSID, argv[0])
 	if err != nil {
 		return 0, err
 	}
@@ -588,7 +590,7 @@ func uniqueNonZeroHandles(handles []windows.Handle) []windows.Handle {
 	return out
 }
 
-func grantAppContainerFilesystem(sid *windows.SID, spec Spec, extraWritableRoots ...string) (func(), error) {
+func grantAppContainerFilesystem(residueRun *windowsResidueRun, sid *windows.SID, spec Spec, extraWritableRoots ...string) (func(), error) {
 	objectSIDStrs := appContainerObjectAccessSIDStrings(sid)
 	writableSIDStrs := appContainerWritableAccessSIDStrings(sid)
 	var cleanup []func()
@@ -651,7 +653,7 @@ func grantAppContainerFilesystem(sid *windows.SID, spec Spec, extraWritableRoots
 		// applying the deny and recording it — or a silent marker write failure —
 		// would leave the user's SID denied on this path with no marker for the
 		// next run to sweep, locking them out of e.g. ~/.ssh permanently.
-		if err := recordResidueBeforeApply(residueDeny, root); err != nil {
+		if err := residueRun.recordBeforeApply(residueDeny, root); err != nil {
 			runCleanup(cleanup)()
 			return func() {}, err
 		}
@@ -678,7 +680,7 @@ func forbidReadDenySIDStrings(base []string) []string {
 	return dedupeSIDStrings(out)
 }
 
-func grantAppContainerExecutable(sid *windows.SID, exe string) (func(), error) {
+func grantAppContainerExecutable(residueRun *windowsResidueRun, sid *windows.SID, exe string) (func(), error) {
 	objectSIDStrs := appContainerObjectAccessSIDStrings(sid)
 	var cleanup []func()
 	for _, dir := range windowsMutableExecutableGrantRoots(exe) {
@@ -696,7 +698,7 @@ func grantAppContainerExecutable(sid *windows.SID, exe string) (func(), error) {
 		// tool-directory ACL with no marker for the next run to sweep. A marker
 		// write failure aborts this dir's grant (restore and skip) rather than
 		// applying an untracked grant.
-		if err := recordResidueBeforeApply(residueGrant, dir); err != nil {
+		if err := residueRun.recordBeforeApply(residueGrant, dir); err != nil {
 			restore()
 			continue
 		}
