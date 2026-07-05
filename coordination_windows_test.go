@@ -225,6 +225,44 @@ func TestWindowsResidueMarkerWriteFailurePropagates(t *testing.T) {
 	}
 }
 
+func TestSweepableResidueRefusesSystemPaths(t *testing.T) {
+	// The sweep must never act on a marker entry that names a system directory,
+	// even though the current recorder can no longer write one: a marker left by
+	// an older binary, or planted in the same-user-writable %TEMP%, would
+	// otherwise drive icacls /remove:g of the broad built-in package SIDs against
+	// System32 / Program Files and strip factory ACEs. User paths must stay
+	// sweepable or crash residue would never be cleaned.
+	userDir := t.TempDir()
+	for _, e := range []residueEntry{
+		{kind: residueDeny, path: filepath.Join(userDir, ".ssh")},
+		{kind: residueGrant, path: userDir},
+	} {
+		if !sweepableResidue(e) {
+			t.Fatalf("user path %q must be sweepable", e.path)
+		}
+	}
+
+	sysExe := systemRootTool("icacls.exe")
+	if !filepath.IsAbs(sysExe) {
+		t.Skip("no absolute system tool to derive a system directory from")
+	}
+	sysDir := filepath.Dir(sysExe)
+	for _, e := range []residueEntry{
+		{kind: residueGrant, path: sysDir},
+		{kind: residueDeny, path: sysDir},
+		{kind: residueGrant, path: filepath.Join(sysDir, "sub")},
+	} {
+		if sweepableResidue(e) {
+			t.Fatalf("system path %q must never be sweepable", e.path)
+		}
+	}
+	if root := os.Getenv("ProgramFiles"); root != "" {
+		if sweepableResidue(residueEntry{kind: residueGrant, path: root}) {
+			t.Fatalf("Program Files root %q must never be sweepable", root)
+		}
+	}
+}
+
 func TestWindowsMutatedRootsForRunLocksNonSystemExeDirOnly(t *testing.T) {
 	workspace := t.TempDir()
 	// A non-system tool directory must join the lock set; a Windows system

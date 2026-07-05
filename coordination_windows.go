@@ -316,7 +316,7 @@ func sweepWindowsDenyResidue() {
 		}
 		markerPath := filepath.Join(dir, entry.Name())
 		for _, e := range readResidueMarker(markerPath) {
-			if !pathExists(e.path) {
+			if !pathExists(e.path) || !sweepableResidue(e) {
 				continue
 			}
 			switch e.kind {
@@ -328,6 +328,20 @@ func sweepWindowsDenyResidue() {
 		}
 		_ = os.Remove(markerPath)
 	}
+}
+
+// sweepableResidue reports whether a marker entry names a path the sandbox
+// could actually have mutated. The current code never records a system
+// directory (windowsMutableExecutableGrantRoots filters them before any
+// snapshot, grant, or marker line), but the marker file itself is untrusted
+// input: an older sandbox binary may have written one before that filter
+// existed, and the marker directory lives under the user's %TEMP%, writable to
+// anything running as the same user. Removing the broad built-in package SIDs
+// (ALL APPLICATION PACKAGES / ALL RESTRICTED APPLICATION PACKAGES) from
+// System32 or Program Files would strip factory ACEs the OS itself relies on,
+// so the sweep re-checks the invariant instead of trusting the marker.
+func sweepableResidue(e residueEntry) bool {
+	return !isWindowsSystemRoot(e.path)
 }
 
 // readResidueMarker parses "<kind>\t<path>" lines. A tab splits the fields so a
