@@ -681,10 +681,13 @@ func forbidReadDenySIDStrings(base []string) []string {
 func grantAppContainerExecutable(sid *windows.SID, exe string) (func(), error) {
 	objectSIDStrs := appContainerObjectAccessSIDStrings(sid)
 	var cleanup []func()
-	for _, dir := range windowsExecutableGrantRoots(exe) {
-		// System and package-manager locations commonly already grant AppContainer
-		// read/execute through built-in package SIDs. Treat this as a best-effort
-		// convenience for local tools instead of failing before the OS can decide.
+	for _, dir := range windowsMutableExecutableGrantRoots(exe) {
+		// Only non-system tool directories reach here; system locations already
+		// grant AppContainer read/execute through built-in package SIDs and are
+		// excluded upstream so a crash can never leave residue that a later sweep
+		// would strip from a system directory. Treat the remaining local-tool
+		// grants as best-effort convenience instead of failing before the OS can
+		// decide.
 		restore, _, err := snapshotPathSecurity(dir, false)
 		if err != nil {
 			continue
@@ -732,6 +735,31 @@ func windowsExecutableGrantRoots(exe string) []string {
 		roots = append(roots, gitRoot)
 	}
 	return dedupeWindowsRoots(roots)
+}
+
+// windowsMutableExecutableGrantRoots is the subset of the run's executable grant
+// roots whose ACLs the sandbox will actually mutate: the non-system ones. System
+// tool directories (System32, the Program Files variants) already grant
+// AppContainer read/execute through Windows' built-in package SIDs, so an
+// AppContainer child can execute a system shell without any sandbox grant. They
+// are deliberately excluded so the sandbox never snapshots, grants, or records
+// crash-residue for them: a residue entry on a system directory would let a later
+// sweep run icacls /remove:g for the broad built-in package SIDs and strip the
+// directory's factory ACEs. This is the single source of truth shared by both the
+// per-root lock set (windowsMutatedRootsForRun) and the grant loop
+// (grantAppContainerExecutable), so the paths that are locked and the paths that
+// are mutated can never drift apart. Membership is by path, not a write probe, so
+// it stays stable when the process is elevated (an admin can create a file under
+// System32, which a probe would misread as writable and wrongly pull in).
+func windowsMutableExecutableGrantRoots(exe string) []string {
+	roots := windowsExecutableGrantRoots(exe)
+	out := make([]string, 0, len(roots))
+	for _, dir := range roots {
+		if !isWindowsSystemRoot(dir) {
+			out = append(out, dir)
+		}
+	}
+	return out
 }
 
 func windowsGitInstallRoot(exe string) string {

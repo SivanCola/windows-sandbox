@@ -258,6 +258,38 @@ func TestWindowsMutatedRootsForRunLocksNonSystemExeDirOnly(t *testing.T) {
 	}
 }
 
+func TestWindowsMutableExecutableGrantRootsExcludesSystemDirs(t *testing.T) {
+	// The grant loop (grantAppContainerExecutable) and the per-root lock both draw
+	// their executable roots from windowsMutableExecutableGrantRoots, so it is the
+	// single guard that keeps system directories from being snapshotted, granted,
+	// or recorded as crash residue. A residue entry on System32 would let a later
+	// sweep run icacls /remove:g for the broad built-in package SIDs and strip the
+	// directory's factory ACEs, so a system tool dir must never appear here.
+	toolDir := t.TempDir()
+	toolExe := filepath.Join(toolDir, "mytool.exe")
+	if err := os.WriteFile(toolExe, []byte("not really an exe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := windowsMutableExecutableGrantRoots(toolExe); !containsWindowsPath(got, toolDir) {
+		t.Fatalf("grant roots = %v, want non-system tool dir %s", got, toolDir)
+	}
+
+	sysExe := systemRootTool("icacls.exe")
+	if !filepath.IsAbs(sysExe) {
+		t.Skip("no absolute system tool to test the system-root exclusion")
+	}
+	sysDir := filepath.Dir(sysExe)
+	got := windowsMutableExecutableGrantRoots(sysExe)
+	if containsWindowsPath(got, sysDir) {
+		t.Fatalf("system exe dir %s must never be a mutable grant root: %v", sysDir, got)
+	}
+	// The same executable must still resolve to a non-empty grant candidate before
+	// the system filter, so the exclusion is what drops it — not a resolution miss.
+	if len(windowsExecutableGrantRoots(sysExe)) == 0 {
+		t.Fatalf("system exe %s should resolve to a grant candidate before filtering", sysExe)
+	}
+}
+
 func TestIsWindowsSystemRoot(t *testing.T) {
 	// System locations are excluded by path, independent of writability.
 	sysExe := systemRootTool("icacls.exe")

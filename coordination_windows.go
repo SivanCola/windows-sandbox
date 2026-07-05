@@ -184,30 +184,26 @@ func windowsMutatedRoots(spec Spec) []string {
 }
 
 // windowsMutatedRootsForRun extends windowsMutatedRoots with the executable
-// directories the run will grant on, but only the non-system ones. A run
+// directories the run will actually mutate ACLs on: the non-system ones. A run
 // snapshots/grants/restores argv[0]'s directory (and a Git install root), so two
 // runs in different workspaces that share one tool directory would otherwise
 // interleave their ACL snapshots and corrupt each other. System tool directories
-// (System32, Program Files) must be left out of the lock, or every command
-// sharing the system shell would needlessly serialize; they are identified by
-// path membership rather than a write probe, because a write probe misclassifies
-// them whenever the process is elevated (an admin can create a file under
-// System32, which would wrongly pull it into the lock set).
+// (System32, Program Files) are never mutated (grantAppContainerExecutable skips
+// them), so they must stay out of the lock too — both sets draw from the same
+// windowsMutableExecutableGrantRoots so the locked paths and the mutated paths
+// cannot drift apart, and every command sharing the system shell is spared a
+// needless serialization.
 func windowsMutatedRootsForRun(spec Spec, exe string) []string {
 	roots := windowsMutatedRoots(spec)
-	for _, dir := range windowsExecutableGrantRoots(exe) {
-		if !isWindowsSystemRoot(dir) {
-			roots = append(roots, dir)
-		}
-	}
-	return roots
+	return append(roots, windowsMutableExecutableGrantRoots(exe)...)
 }
 
 // isWindowsSystemRoot reports whether path is inside a Windows system location
 // (%SystemRoot%, the Program Files variants). Determined by path membership, not
 // by attempting a write, so the result is stable regardless of the process's
-// integrity level or admin rights. Used to keep shared system directories out of
-// the per-root lock set.
+// integrity level or admin rights. Backs windowsMutableExecutableGrantRoots,
+// which keeps shared system directories out of both the per-root lock set and
+// the executable grant/residue set.
 func isWindowsSystemRoot(path string) bool {
 	clean := strings.ToLower(filepath.Clean(path))
 	for _, envVar := range []string{"SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"} {
